@@ -4,6 +4,11 @@
 
 <#UPDATENotes
 
+06.10.2026
+v 2.07
+- info about logon Acount for services
+- list of delayed services
+
 08.02.2021 
 v 2.06
 - added summary of Atos tooling (EPO, BSA, Centreon, Flexera)
@@ -447,8 +452,34 @@ $Licence = CheckLicence
 #$PortCheck = CheckPorts
 #Services list
 Write-Host "Getting services information..."
-$all_services = Get-Service | Select-Object Name,DisplayName,ServiceName,StartType,Status 
-$stopped_services = $all_services | where-Object {($_.StartType -eq 'Automatic') -and  ($_.Status -ne 'Running')}
+
+$all_services = Get-CimInstance Win32_Service | ForEach-Object {
+[PSCustomObject]@{
+Name = $_.Name
+DisplayName = $_.DisplayName
+Status = $_.State
+StartType = $_.StartMode
+LogonAccount = $_.StartName
+DependsOn = ($_.Dependencies -join '; ')
+}
+}
+
+$stopped_services = Get-Service  | where-Object {($_.StartType -eq 'Automatic') -and  ($_.Status -ne 'Running')}
+
+# Delayed services 
+$delayed = Get-CimInstance Win32_Service | Where-Object {$_.DelayedAutoStart -eq $true} | ForEach-Object {
+$svc_delayed = Get-Service -Name $_.Name
+
+[PSCustomObject]@{
+# ServiceName = $_.Name
+Name = $_.DisplayName
+LogonAccount = $_.StartName
+DependsOn = ($svc_delayed.ServicesDependedOn.Name -join '; ')
+}
+}
+
+
+
 #Hotfix info
 Write-Host "Getting hotfixes information..."
 $FixHot = get-hotfix | Select-Object HotFixID, InstalledOn, InstalledBy | Sort-Object InstalledOn -Descending
@@ -471,8 +502,8 @@ else
 Write-Host "Getting installed applications information..."
 $Apps = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Select-Object DisplayName, DisplayVersion, InstallDate
 #JAC Getting GPO result
-#Atos Tooling info and health
-Write-Host "Getting Atos Tooling information..."
+#Tooling info and health
+Write-Host "Getting Tooling information..."
 $tooling = CheckAtosTooling
 Write-Host "Getting RSOP results ..."
 #$gpresult_file = "\\155.45.163.189\ts_emea$\_public\a562569\$env:COMPUTERNAME-rsop.html"
@@ -1050,6 +1081,19 @@ $IloInfo = Get-IloInfo
     $objHTML+=	"</table>"
 
 
+    ######delayed services table######
+    $objHTML+= "<table width=100%>"
+    $objHTML+= "<tr> <br> </tr>" 
+    $objHTML+= "<tr>"
+    $objHTML+= "<th class=""label""> Delayed Services [starttype=automatic delayed] + dependencies  </th>"
+    $objHTML+= "</tr>"
+    $delayedhtml = $delayed | ConvertTo-Html -Fragment | out-string
+
+    #Loop for each item in Array
+	$objHTML+=	"<td>" + $delayedhtml + "</td>"
+    $objHTML+=	"</table>"
+
+
 
 ################HOT FIX###################
     $objHTML+=	"<table width=100%>"
@@ -1171,7 +1215,7 @@ $objHTML+= "</table>"
     $objHTML+= "<table width=100%>"
     $objHTML+= '<tr> <br> </tr>' 
     $objHTML+= "<tr>"
-    $objHTML+= '<th class="label"> Atos Tooling Details  </th>'
+    $objHTML+= '<th class="label"> Tooling Details  </th>'
     $objHTML+= "</tr>"
 
     $objHTML+= "<tr>"
@@ -1243,10 +1287,10 @@ $objHTML+=	"</html>"
 
 
 
-#$objHTML | out-file "\\155.45.163.189\ts_emea$\_public\a562569\$env:COMPUTERNAME.html"
+#$objHTML | out-file "\\155.45.163.189\ts_emea$\_public\MTP\$env:COMPUTERNAME.html"
 #$objHTML | out-file ".\$env:COMPUTERNAME.html"
 
 
-# filename + timestamp prevenets owerwrite output file (mala rzecz a cieszy)
+# filename + timestamp prevenets owerwrite output file (mala rzecz a cieszy xD)
 $filename = "$env:COMPUTERNAME {0:yyyyMMdd-HHmm}" -f (Get-Date)
 $objHTML | out-file .\$filename.html
