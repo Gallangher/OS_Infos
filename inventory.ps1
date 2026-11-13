@@ -169,7 +169,21 @@ function GetDiskInfo {
     return $DiskData
 }
 
+function GetIPConfig {
+    try {
+        $Output = & "$env:SystemRoot\System32\ipconfig.exe" /all 2>&1
+        $ExitCode = $LASTEXITCODE
 
+        if ($ExitCode -ne 0) {
+            throw "ipconfig failed with exit code $ExitCode."
+        }
+
+        return ($Output -join [Environment]::NewLine)
+    } catch {
+        Write-Warning "Cannot collect ipconfig: $($_.Exception.Message)"
+        return "Unable to collect ipconfig /all output."
+    }
+}
 
 
 ############## RAW DATA collection ################
@@ -182,15 +196,15 @@ $SystemConfig = GetBase
 Write-Host "Getting disk and volume information..."
 $DiskConfig = GetDiskInfo
 
-
-
+Write-Host "Getting network configuration..."
+$IPConfigData = GetIPConfig
 
 # Calculate script execution time before building the footer
 $interval = New-TimeSpan -Start $startTime -End (Get-Date)
 
 
 
-############## RAW DATA Input 2 HTML format ###############
+############## RAW DATA Input To  HTML format ###############
 
 $objFormattedDate = Get-Date -Format "dd-MM-yyyy HH:mm:ss"
 $objHost = $env:COMPUTERNAME
@@ -252,6 +266,25 @@ $objHTML = @"
             color: #006600;
             font-weight: bold;
         }
+        .info-blue {
+    background-color: #dbeafe;
+    color: #1e3a8a;
+    font-weight: bold;
+        }
+        .raw-output {
+            margin: 0;
+            padding: 10px;
+            font-family: Consolas, "Courier New", monospace;
+            font-size: 12px;
+            font-weight: normal;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            background-color: #f3f4f6;
+            color: #111827;
+                       }
+
+
+
     </style>
 </head>
 <body>
@@ -259,6 +292,27 @@ $objHTML = @"
 "@
 
 ############# System Info Table #################
+
+# Highlight BLUE values only when VM is explicitly Boolean True.
+$VMValueClass = if (
+    $SystemConfig["VM"] -is [bool] -and
+    $SystemConfig["VM"] -eq $true
+) {
+    ' class="info-blue"'
+} else {
+    ''
+}
+
+
+# Apply .alert-red when a pending reboot is detected.
+$PendingRebootRowClass = if (
+    ([string]$SystemConfig["PendingReboot"]).Trim() -ieq "True"
+) {
+    ' class="alert-red"'
+} else {
+    ''
+}
+## create table
 $objHTML += @"
     <table>
         <thead>
@@ -273,9 +327,9 @@ $objHTML += @"
             <tr><td class="key-col">OS Language</td><td>$($SystemConfig["Language"])</td></tr>
             <tr><td class="key-col">Install Date</td><td>$($SystemConfig["InstallDate"])</td></tr>
             <tr><td class="key-col">Time Zone</td><td>$($SystemConfig["TimeZone"])</td></tr>
-            <tr><td class="key-col">Virtual Machine</td><td>$($SystemConfig["VM"])</td></tr>      
-            <tr><td class="key-col">Hardware Model</td><td>$($SystemConfig["Model"])</td></tr>
-            <tr><td class="key-col">Manufacturer</td><td>$($SystemConfig["Manufacturer"])</td></tr>      
+            <tr><td class="key-col">Virtual Machine</td><td$VMValueClass>$($SystemConfig["VM"])</td></tr>
+            <tr><td class="key-col">Hardware Model</td><td$VMValueClass>$($SystemConfig["Model"])</td></tr>
+            <tr><td class="key-col">Manufacturer</td><td$VMValueClass>$($SystemConfig["Manufacturer"])</td></tr>
             <tr><td class="key-col">Serial Number</td><td>$($SystemConfig["SerialNumber"])</td></tr>
             <tr><td class="key-col">UUID</td><td>$($SystemConfig["UUID"])</td></tr>
             <tr><td class="key-col">Boot Mode</td><td>$($SystemConfig["BootMode"])</td></tr>
@@ -284,7 +338,7 @@ $objHTML += @"
             <tr><td class="key-col">CPU</td><td>$($SystemConfig["CPUInfo"])</td></tr>
             <tr><td class="key-col">Last Boot Time</td><td>$($SystemConfig["LastBoot"])</td></tr>
             <tr><td class="key-col">Uptime [days]</td><td>$($SystemConfig["Uptime"])</td></tr>
-            <tr><td class="key-col">Pending Reboot</td><td>$($SystemConfig["PendingReboot"])</td></tr>
+            <tr$PendingRebootRowClass><td class="key-col">Pending Reboot</td><td>$($SystemConfig["PendingReboot"])</td></tr>
         </tbody>
     </table>
 "@
@@ -382,6 +436,27 @@ $objHTML += @"
         </thead>
         <tbody>
 $PhysicalDiskRows
+        </tbody>
+    </table>
+"@
+
+
+############# Network Configuration Table #################
+
+# Encode collected text so HTML treats it as text, not markup.
+$IPConfigHTML = [System.Net.WebUtility]::HtmlEncode($IPConfigData)
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th class="label">Network Configuration - ipconfig /all</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><pre class="raw-output">$IPConfigHTML</pre></td>
+            </tr>
         </tbody>
     </table>
 "@
