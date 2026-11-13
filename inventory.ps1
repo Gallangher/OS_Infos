@@ -1,4 +1,65 @@
+<#
+.SYNOPSIS
+    Windows Server Inventory Report
 
+.DESCRIPTION
+    Collects configuration and inventory information from a Windows system
+    and generates an HTML report.
+
+    The report includes:
+
+    - Operating system information:
+      OS name, architecture, build number, language, installation date,
+      time zone, last boot time, uptime and pending reboot status.
+
+    - Hardware information:
+      Manufacturer, hardware model, serial number, system UUID,
+      physical memory and processor information.
+
+    - Virtualization information:
+      Detection of virtual machines based on reported hardware model
+      and manufacturer information.
+
+    - Firmware information:
+      Boot mode and Secure Boot status.
+
+    - Disk and volume information:
+      Logical volumes, drive or mount point, volume label, file system,
+      cluster size, total capacity, free space, free space percentage,
+      compression status and dirty-bit status.
+
+      Physical disk information including disk number, model,
+      serial number, capacity, partition style, bus type, media type,
+      health status and operational status.
+
+    - Network configuration:
+      Complete output from "ipconfig /all", including network adapters,
+      IP configuration, MAC addresses, DNS configuration, DHCP information
+      and other network settings reported by Windows.
+
+    - Local administrators:
+      Direct members of the local Administrators group, including account
+      or group name, object type, account source and SID.
+
+    - Windows services:
+      Service name, display name, current state, startup mode,
+      delayed automatic start status, logon account and service dependencies.
+      Automatic services that are not running are highlighted in the report.
+
+    - Installed applications:
+      Application name, version, publisher, reported installation date
+      and installation directory, when this information is available
+      in the Windows uninstall registry entries.
+
+    The collected information is read-only and is written to a local
+    HTML inventory report.
+
+.AUTHOR
+    Krzysztof Gerus
+
+.VERSION
+    2.0
+#>
 
 $startTime = Get-Date
 ######## Function Declare ########
