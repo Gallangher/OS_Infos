@@ -83,6 +83,86 @@ function GetBase {
     return $Machine
 }
 
+
+#Info about local users
+function GetLocalAdmins {
+    try {
+        $Members = @(
+            Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop |
+                Sort-Object Name
+        )
+    } catch {
+        Write-Warning "Cannot collect local administrators: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Members = @()
+            Error   = $_.Exception.Message
+        }
+    }
+
+    # Read local users once and index them by SID.
+    $LocalUsersBySID = @{}
+    $LocalUsersReadOK = $false
+
+    try {
+        $LocalUsers = @(Get-LocalUser -ErrorAction Stop)
+
+        foreach ($User in $LocalUsers) {
+            $LocalUsersBySID[[string]$User.SID] = $User
+        }
+
+        $LocalUsersReadOK = $true
+    } catch {
+        Write-Warning "Cannot read local account status: $($_.Exception.Message)"
+    }
+
+    $Results = @(
+        foreach ($Member in $Members) {
+            $SID = [string]$Member.SID
+            $Source = [string]$Member.PrincipalSource
+
+            if ([string]::IsNullOrWhiteSpace($Source)) {
+                $Source = "Unknown"
+            }
+
+            $Enabled = "N/A"
+
+            if ($Member.ObjectClass -eq "User") {
+                if ($LocalUsersBySID.ContainsKey($SID)) {
+                    $Enabled = $LocalUsersBySID[$SID].Enabled
+                } elseif (-not $LocalUsersReadOK) {
+                    # Account status could not be checked.
+                    $Enabled = "Unknown"
+                } elseif (
+                    $Source -eq "Local" -or
+                    $Member.Name -like "$env:COMPUTERNAME\*"
+                ) {
+                    # Looks local, but no matching local user was found.
+                    $Enabled = "Unknown"
+                }
+            } elseif ($Member.ObjectClass -ne "Group") {
+                $Enabled = "Unknown"
+            }
+
+            [PSCustomObject]@{
+                Name            = $Member.Name
+                ObjectClass     = $Member.ObjectClass
+                PrincipalSource = $Source
+                SID             = $SID
+                Enabled         = $Enabled
+            }
+        }
+    )
+
+    return [PSCustomObject]@{
+        Success = $true
+        Members = $Results
+        Error   = ""
+    }
+}
+
+
 ## Disk Info
 
 function GetDiskInfo {
@@ -186,11 +266,246 @@ function GetIPConfig {
 }
 
 
+#services
+function GetServicesInfo {
+    # Collect service configuration and current state.
+    try {
+        $Services = @(
+            Get-CimInstance -ClassName Win32_Service -ErrorAction Stop |
+                Sort-Object DisplayName
+        )
+    } catch {
+        Write-Warning "Cannot collect services: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Services = @()
+            Error = $_.Exception.Message
+        }
+    }
+
+    # Collect service controllers once and index them by name.
+    $ControllersByName = @{}
+
+    try {
+        $Controllers = @(Get-Service -ErrorAction Stop)
+
+        foreach ($Controller in $Controllers) {
+            $ControllersByName[$Controller.Name] = $Controller
+        }
+    } catch {
+        Write-Warning "Cannot collect service dependencies: $($_.Exception.Message)"
+    }
+
+    $Results = @(
+        foreach ($Service in $Services) {
+            $DependsOn = "Unknown"
+
+            if ($ControllersByName.ContainsKey($Service.Name)) {
+                try {
+                    $Dependencies = @(
+                        $ControllersByName[$Service.Name].ServicesDependedOn |
+                            Select-Object -ExpandProperty Name
+                    )
+
+                    $DependsOn = if ($Dependencies.Count -gt 0) {
+                        $Dependencies -join "; "
+                    } else {
+                        "None"
+                    }
+                } catch {
+                    Write-Warning "Cannot read dependencies for $($Service.Name): $($_.Exception.Message)"
+                }
+            }
+
+            # Missing delayed-start information must not become False.
+            $DelayedAutoStart = if (
+                $null -ne $Service.DelayedAutoStart
+            ) {
+                $Service.DelayedAutoStart
+            } else {
+                "Unknown"
+            }
+
+            # Use a readable label in the report.
+            $StartMode = if ($Service.StartMode -eq "Auto") {
+                "Automatic"
+            } else {
+                $Service.StartMode
+            }
+
+            [PSCustomObject]@{
+                Name             = $Service.Name
+                DisplayName      = $Service.DisplayName
+                State            = $Service.State
+                StartMode        = $StartMode
+                DelayedAutoStart = $DelayedAutoStart
+                LogonAccount     = $Service.StartName
+                DependsOn        = $DependsOn
+            }
+        }
+    )
+
+    return [PSCustomObject]@{
+        Success = $true
+        Services = $Results
+        Error = ""
+    }
+}
+
+
+##### aplikacje
+function GetInstalledApplications {
+    $Applications = @()
+    $ReadErrors = @()
+
+    $UninstallPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+
+    # Read both registry views on a 64-bit operating system.
+    $RegistryViews = if ([Environment]::Is64BitOperatingSystem) {
+        @(
+            [Microsoft.Win32.RegistryView]::Registry64
+            [Microsoft.Win32.RegistryView]::Registry32
+        )
+    } else {
+        @(
+            [Microsoft.Win32.RegistryView]::Registry32
+        )
+    }
+
+    foreach ($View in $RegistryViews) {
+        $BaseKey = $null
+        $UninstallKey = $null
+
+        try {
+            $BaseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::LocalMachine,
+                $View
+            )
+
+            $UninstallKey = $BaseKey.OpenSubKey($UninstallPath)
+
+            # A missing Uninstall key means no entries in this view.
+            if ($null -eq $UninstallKey) {
+                continue
+            }
+
+            foreach ($SubKeyName in $UninstallKey.GetSubKeyNames()) {
+                $AppKey = $null
+
+                try {
+                    $AppKey = $UninstallKey.OpenSubKey($SubKeyName)
+
+                    if ($null -eq $AppKey) {
+                        throw "Registry entry is no longer available."
+                    }
+
+                    $Name = [string]$AppKey.GetValue("DisplayName")
+
+                    # Skip entries without an application name.
+                    if ([string]::IsNullOrWhiteSpace($Name)) {
+                        continue
+                    }
+
+                    $Version = [string]$AppKey.GetValue("DisplayVersion")
+                    $Publisher = [string]$AppKey.GetValue("Publisher")
+                    $InstallLocation = [string]$AppKey.GetValue("InstallLocation")
+                    $RawDate = [string]$AppKey.GetValue("InstallDate")
+
+                    # Convert yyyyMMdd dates; preserve other non-empty values.
+                    $InstallDate = "Unknown"
+
+                    if (-not [string]::IsNullOrWhiteSpace($RawDate)) {
+                        $ParsedDate = [datetime]::MinValue
+
+                        if ([datetime]::TryParseExact(
+                            $RawDate.Trim(),
+                            "yyyyMMdd",
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [System.Globalization.DateTimeStyles]::None,
+                            [ref]$ParsedDate
+                        )) {
+                            $InstallDate = $ParsedDate.ToString("yyyy-MM-dd")
+                        } else {
+                            $InstallDate = $RawDate.Trim()
+                        }
+                    }
+
+                    $Applications += [PSCustomObject]@{
+                        Name = $Name.Trim()
+
+                        Version = if (
+                            [string]::IsNullOrWhiteSpace($Version)
+                        ) {
+                            "Unknown"
+                        } else {
+                            $Version.Trim()
+                        }
+
+                        Publisher = if (
+                            [string]::IsNullOrWhiteSpace($Publisher)
+                        ) {
+                            "Unknown"
+                        } else {
+                            $Publisher.Trim()
+                        }
+
+                        ReportedInstallDate = $InstallDate
+
+                        InstallLocation = if (
+                            [string]::IsNullOrWhiteSpace($InstallLocation)
+                        ) {
+                            "Unknown"
+                        } else {
+                            $InstallLocation.Trim()
+                        }
+                    }
+                } catch {
+                    $Message = "Cannot read application entry [$View / $SubKeyName]: $($_.Exception.Message)"
+                    $ReadErrors += $Message
+                    Write-Warning $Message
+                } finally {
+                    if ($null -ne $AppKey) {
+                        $AppKey.Dispose()
+                    }
+                }
+            }
+        } catch {
+            $Message = "Cannot read installed applications [$View]: $($_.Exception.Message)"
+            $ReadErrors += $Message
+            Write-Warning $Message
+        } finally {
+            if ($null -ne $UninstallKey) {
+                $UninstallKey.Dispose()
+            }
+
+            if ($null -ne $BaseKey) {
+                $BaseKey.Dispose()
+            }
+        }
+    }
+
+$SortedApplications = @(
+        $Applications | Sort-Object Name, Version
+    )
+
+    return [PSCustomObject]@{
+        Success      = ($ReadErrors.Count -eq 0 -or $SortedApplications.Count -gt 0)
+        Applications = $SortedApplications
+        Error        = ($ReadErrors -join "; ")
+    }
+}
+
 ############## RAW DATA collection ################
 
 # SystemInfo
 Write-Host "Getting system information..."
 $SystemConfig = GetBase
+
+# Local Admins
+Write-Host "Getting local administrators..."
+$LocalAdminsConfig = GetLocalAdmins
+
 
 # DiskInfo (Logical Volumes & Physical Disks)
 Write-Host "Getting disk and volume information..."
@@ -198,6 +513,12 @@ $DiskConfig = GetDiskInfo
 
 Write-Host "Getting network configuration..."
 $IPConfigData = GetIPConfig
+
+Write-Host "Getting services information..."
+$ServicesConfig = GetServicesInfo
+
+Write-Host "Getting installed applications..."
+$AppsConfig = GetInstalledApplications
 
 # Calculate script execution time before building the footer
 $interval = New-TimeSpan -Start $startTime -End (Get-Date)
@@ -302,8 +623,6 @@ $VMValueClass = if (
 } else {
     ''
 }
-
-
 # Apply .alert-red when a pending reboot is detected.
 $PendingRebootRowClass = if (
     ([string]$SystemConfig["PendingReboot"]).Trim() -ieq "True"
@@ -346,6 +665,64 @@ $objHTML += @"
 ###########################################################################
 ### START: PASTE ADDITIONAL TABLES BELOW (e.g., Disks, Network, Services) ###
 ###########################################################################
+
+
+############# Local Administrators Table #################
+
+$LocalAdminRows = ""
+
+if (-not $LocalAdminsConfig.Success) {
+    $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$LocalAdminsConfig.Error
+    )
+
+    $LocalAdminRows = "<tr><td colspan='4'>Unable to collect local administrators: $ErrorHTML</td></tr>"
+} elseif ($LocalAdminsConfig.Members.Count -eq 0) {
+    $LocalAdminRows = "<tr><td colspan='4'>No direct members returned.</td></tr>"
+} else {
+    foreach ($Member in $LocalAdminsConfig.Members) {
+        $NameHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Member.Name
+        )
+        $TypeHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Member.ObjectClass
+        )
+        $SourceHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Member.PrincipalSource
+        )
+        $SIDHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Member.SID
+        )
+
+        $LocalAdminRows += @"
+            <tr>
+                <td>$NameHTML</td>
+                <td>$TypeHTML</td>
+                <td>$SourceHTML</td>
+                <td>$SIDHTML</td>
+            </tr>
+"@
+    }
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="4" class="label">Local Administrators - Direct Members</th>
+            </tr>
+            <tr>
+                <th>Account / Group</th>
+                <th>Type</th>
+                <th>Source</th>
+                <th>SID</th>
+            </tr>
+        </thead>
+        <tbody>
+$LocalAdminRows
+        </tbody>
+    </table>
+"@
 
 ############# Logical Volumes Table #################
 $VolumeRows = ""
@@ -460,6 +837,196 @@ $objHTML += @"
         </tbody>
     </table>
 "@
+########## services
+
+############# Services Table #################
+
+$ServiceRows = ""
+
+if (-not $ServicesConfig.Success) {
+    $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$ServicesConfig.Error
+    )
+
+    $ServiceRows = @"
+            <tr>
+                <td colspan="7">Unable to collect services: $ErrorHTML</td>
+            </tr>
+"@
+} elseif ($ServicesConfig.Services.Count -eq 0) {
+    $ServiceRows = @"
+            <tr>
+                <td colspan="7">No services returned.</td>
+            </tr>
+"@
+} else {
+    foreach ($Service in $ServicesConfig.Services) {
+        # Highlight automatic services that are not Running.
+        $ServiceRowClass = if (
+            $Service.StartMode -eq "Automatic" -and
+            $Service.State -ne "Running"
+        ) {
+            ' class="alert-red"'
+        } else {
+            ''
+        }
+
+        # Encode every value before inserting it into HTML.
+        $NameHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.Name
+        )
+
+        $DisplayNameHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.DisplayName
+        )
+
+        $StateHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.State
+        )
+
+        $StartModeHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.StartMode
+        )
+
+        $DelayedHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.DelayedAutoStart
+        )
+
+        $LogonHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.LogonAccount
+        )
+
+        $DependsOnHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Service.DependsOn
+        )
+
+        $ServiceRows += @"
+            <tr${ServiceRowClass}>
+                <td>$NameHTML</td>
+                <td>$DisplayNameHTML</td>
+                <td>$StateHTML</td>
+                <td>$StartModeHTML</td>
+                <td>$DelayedHTML</td>
+                <td>$LogonHTML</td>
+                <td>$DependsOnHTML</td>
+            </tr>
+"@
+    }
+}
+
+## Create table
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="7" class="label">Services</th>
+            </tr>
+            <tr>
+                <th>Name</th>
+                <th>Display Name</th>
+                <th>State</th>
+                <th>Start Mode</th>
+                <th>Delayed Start</th>
+                <th>Log On As</th>
+                <th>Depends On</th>
+            </tr>
+        </thead>
+        <tbody>
+$ServiceRows
+        </tbody>
+    </table>
+"@
+
+############# Installed Applications Table #################
+
+$AppRows = ""
+
+
+
+if (-not $AppsConfig.Success -and $ApplicationsConfig.Applications.Count -eq 0) {
+    $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$AppsConfig.Error
+    )
+
+    $AppRows = @"
+            <tr>
+                <td colspan="5" class="alert-red">Unable to collect installed applications: $ErrorHTML</td>
+            </tr>
+"@
+} elseif ($AppsConfig.Applications.Count -eq 0) {
+    $AppRows = @"
+            <tr>
+                <td colspan="5">No installed applications found.</td>
+            </tr>
+"@
+} else {
+    foreach ($App in $AppsConfig.Applications) {
+        # Encode every value before inserting it into HTML
+        $AppNameHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$App.Name
+        )
+
+        $AppVersionHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$App.Version
+        )
+
+        $AppPublisherHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$App.Publisher
+        )
+
+        $AppDateHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$App.ReportedInstallDate
+        )
+
+        $AppLocationHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$App.InstallLocation
+        )
+
+        $AppRows += @"
+            <tr>
+                <td><strong>$AppNameHTML</strong></td>
+                <td>$AppVersionHTML</td>
+                <td>$AppPublisherHTML</td>
+                <td>$AppDateHTML</td>
+                <td>$AppLocationHTML</td>
+            </tr>
+"@
+    }
+
+    # Append a warning row if partial registry read errors occurred
+    if (-not [string]::IsNullOrWhiteSpace($AppsConfig.Error)) {
+        $PartialErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$AppsConfig.Error
+        )
+
+        $AppRows += @"
+            <tr>
+                <td colspan="5" class="alert-red">Warning (partial read errors): $PartialErrorHTML</td>
+            </tr>
+"@
+    }
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="5" class="label">Installed Applications ($($AppsConfig.Applications.Count))</th>
+            </tr>
+            <tr>
+                <th>Application Name</th>
+                <th>Version</th>
+                <th>Publisher</th>
+                <th>Install Date</th>
+                <th>Install Location</th>
+            </tr>
+        </thead>
+        <tbody>
+$AppRows
+        </tbody>
+    </table>
+"@
+
 
 
 ###########################################################################
