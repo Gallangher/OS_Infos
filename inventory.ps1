@@ -3,8 +3,8 @@
     Windows Server Inventory Report
 
 .DESCRIPTION
-    Collects configuration and inventory information from a Windows system
-    and generates an HTML report.
+    Collects configuration, hardware, network, software and operational
+    information from a Windows system and generates an HTML inventory report.
 
     The report includes:
 
@@ -24,7 +24,7 @@
       Boot mode and Secure Boot status.
 
     - Disk and volume information:
-      Logical volumes, drive or mount point, volume label, file system,
+      Logical volumes and mount points, volume label, file system,
       cluster size, total capacity, free space, free space percentage,
       compression status and dirty-bit status.
 
@@ -37,6 +37,20 @@
       IP configuration, MAC addresses, DNS configuration, DHCP information
       and other network settings reported by Windows.
 
+    - WinHTTP proxy configuration:
+      Current system WinHTTP proxy configuration collected using
+      "netsh winhttp show proxy".
+
+    - Routing information:
+      Current IPv4 and IPv6 routing information collected using
+      "route print", including active and persistent routes reported
+      by Windows.
+
+    - Listening TCP ports:
+      TCP endpoints currently in the LISTEN state, including local IP
+      address, port, IPv4/IPv6 address family, owning process ID,
+      process name, process account and executable path when available.
+
     - Local administrators:
       Direct members of the local Administrators group, including account
       or group name, object type, account source and SID.
@@ -44,22 +58,34 @@
     - Windows services:
       Service name, display name, current state, startup mode,
       delayed automatic start status, logon account and service dependencies.
-      Automatic services that are not running are highlighted in the report.
+
+      Automatic services that are not currently running are highlighted
+      in the HTML report for review.
 
     - Installed applications:
-      Application name, version, publisher, reported installation date
-      and installation directory, when this information is available
-      in the Windows uninstall registry entries.
+      Applications registered in the Windows Uninstall registry entries,
+      including application name, version, publisher, reported installation
+      date and installation directory when this information is available.
 
-    The collected information is read-only and is written to a local
-    HTML inventory report.
+      On 64-bit systems, both 64-bit and 32-bit registry views are checked.
+
+    - System event log:
+      Recent Critical and Error events from the Windows System event log.
+
+      The report includes event timestamp, Event ID, provider, Record ID,
+      Process ID and event message. The maximum number of collected events
+      is configurable by the script.
+
+    The script performs inventory and diagnostic data collection only.
+    The collected information is written to a local HTML report.
 
 .AUTHOR
     Krzysztof Gerus
 
 .VERSION
-    2.0
+    2.2
 #>
+
 
 $startTime = Get-Date
 ######## Function Declare ########
@@ -300,6 +326,7 @@ function GetDiskInfo {
                 SizeGB         = [math]::Round($Disk.Size / 1GB, 2)
                 PartitionStyle = "N/A (Legacy OS)"
                 BusType        = $Disk.InterfaceType
+
                 MediaType      = $Disk.MediaType
                 HealthStatus   = $Disk.Status
                 Operational    = $Disk.Status
@@ -323,6 +350,196 @@ function GetIPConfig {
     } catch {
         Write-Warning "Cannot collect ipconfig: $($_.Exception.Message)"
         return "Unable to collect ipconfig /all output."
+    }
+}
+
+function GetWinHttpProxy {
+    try {
+        $NetshPath = "$env:SystemRoot\System32\netsh.exe"
+
+        if (-not (Test-Path -LiteralPath $NetshPath)) {
+            throw "netsh.exe was not found: $NetshPath"
+        }
+
+        # Run netsh and capture both standard output and errors.
+        $Output = & $NetshPath winhttp show proxy 2>&1
+        $ExitCode = $LASTEXITCODE
+
+        if ($ExitCode -ne 0) {
+            throw "netsh failed with exit code $ExitCode. Output: $($Output -join ' ')"
+        }
+
+        if ($null -eq $Output -or $Output.Count -eq 0) {
+            throw "netsh returned no output."
+        }
+
+        return [PSCustomObject]@{
+            Success = $true
+            Output  = ($Output -join [Environment]::NewLine)
+            Error   = ""
+        }
+    }
+    catch {
+        Write-Warning "Cannot collect WinHTTP proxy configuration: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Output  = ""
+            Error   = $_.Exception.Message
+        }
+    }
+}
+
+
+function GetRoutingTable {
+    try {
+        $RoutePath = "$env:SystemRoot\System32\route.exe"
+
+        if (-not (Test-Path -LiteralPath $RoutePath)) {
+            throw "route.exe was not found: $RoutePath"
+        }
+
+        # Run route print and capture both standard output and errors.
+        $Output = & $RoutePath print 2>&1
+        $ExitCode = $LASTEXITCODE
+
+        if ($ExitCode -ne 0) {
+            throw "route print failed with exit code $ExitCode. Output: $($Output -join ' ')"
+        }
+
+        if ($null -eq $Output -or $Output.Count -eq 0) {
+            throw "route print returned no output."
+        }
+
+        return [PSCustomObject]@{
+            Success = $true
+            Output  = ($Output -join [Environment]::NewLine)
+            Error   = ""
+        }
+    }
+    catch {
+        Write-Warning "Cannot collect routing table: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Output  = ""
+            Error   = $_.Exception.Message
+        }
+    }
+}
+
+function GetListeningPorts {
+    try {
+        $Connections = @(
+            Get-NetTCPConnection -State Listen -ErrorAction Stop
+        )
+    }
+    catch {
+        Write-Warning "Cannot collect listening TCP ports: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success     = $false
+            Connections = @()
+            Error       = $_.Exception.Message
+        }
+    }
+
+    # Cache process information so the same PID is not queried repeatedly.
+    $ProcessCache = @{}
+
+    $Results = foreach ($Connection in $Connections) {
+
+        $PIDNumber = $Connection.OwningProcess
+
+        $ProcessName = "Unknown"
+        $ProcessPath = "Unknown"
+        $ProcessUser = "Unknown"
+
+        if (-not $ProcessCache.ContainsKey($PIDNumber)) {
+
+            try {
+                $Process = Get-Process -Id $PIDNumber -ErrorAction Stop
+
+                if ($Process.ProcessName) {
+                    $ProcessName = $Process.ProcessName
+                }
+
+                try {
+                    if ($Process.Path) {
+                        $ProcessPath = $Process.Path
+                    }
+                }
+                catch {
+                    $ProcessPath = "Access denied / unavailable"
+                }
+            }
+            catch {
+                $ProcessName = "Unknown"
+            }
+
+            # Get process owner.
+            try {
+                $CimProcess = Get-CimInstance Win32_Process `
+                    -Filter "ProcessId=$PIDNumber" `
+                    -ErrorAction Stop
+
+                if ($CimProcess) {
+                    $Owner = Invoke-CimMethod `
+                        -InputObject $CimProcess `
+                        -MethodName GetOwner `
+                        -ErrorAction Stop
+
+                    if ($Owner.ReturnValue -eq 0 -and $Owner.User) {
+
+                        if ($Owner.Domain) {
+                            $ProcessUser = "$($Owner.Domain)\$($Owner.User)"
+                        }
+                        else {
+                            $ProcessUser = $Owner.User
+                        }
+                    }
+                }
+            }
+            catch {
+                $ProcessUser = "Unknown"
+            }
+
+            $ProcessCache[$PIDNumber] = [PSCustomObject]@{
+                Process = $ProcessName
+                User    = $ProcessUser
+                Path    = $ProcessPath
+            }
+        }
+
+        $ProcessInfo = $ProcessCache[$PIDNumber]
+
+        # Determine IPv4 / IPv6.
+        $AddressFamily = if (
+            $Connection.LocalAddress -match ":"
+        ) {
+            "IPv6"
+        }
+        else {
+            "IPv4"
+        }
+
+        [PSCustomObject]@{
+            IP            = $Connection.LocalAddress
+            Port          = $Connection.LocalPort
+            AddressFamily = $AddressFamily
+            PID           = $PIDNumber
+            Process       = $ProcessInfo.Process
+            User          = $ProcessInfo.User
+            Path          = $ProcessInfo.Path
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success     = $true
+        Connections = @(
+            $Results | Sort-Object Port, IP
+        )
+        Error       = ""
     }
 }
 
@@ -413,6 +630,8 @@ function GetServicesInfo {
         Error = ""
     }
 }
+
+
 
 
 ##### aplikacje
@@ -557,6 +776,76 @@ $SortedApplications = @(
     }
 }
 
+function GetSystemEventErrors {
+    param(
+        [int]$MaxEvents = 20
+    )
+
+    try {
+        if ($MaxEvents -lt 1) {
+            throw "MaxEvents must be greater than zero."
+        }
+
+        $Events = @(
+            Get-WinEvent `
+                -FilterHashtable @{
+                    LogName = "System"
+                    Level   = 1, 2
+                } `
+                -MaxEvents $MaxEvents `
+                -ErrorAction Stop
+        )
+
+        $Results = @(
+            foreach ($Event in $Events) {
+                $Message = if (
+                    [string]::IsNullOrWhiteSpace([string]$Event.Message)
+                ) {
+                    "Message unavailable"
+                } else {
+                    # Replace line breaks to keep the HTML table compact.
+                    ([string]$Event.Message).Trim() -replace "\r?\n", " "
+                }
+
+                [PSCustomObject]@{
+                    TimeCreated  = $Event.TimeCreated
+                    Id           = $Event.Id
+                    ProviderName = $Event.ProviderName
+                    Level        = $Event.LevelDisplayName
+                    RecordId     = $Event.RecordId
+                    ProcessId    = $Event.ProcessId
+                    Message      = $Message
+                }
+            }
+        )
+
+        return [PSCustomObject]@{
+            Success = $true
+            Events  = $Results
+            Error   = ""
+        }
+    }
+    catch {
+        # "No events were found" should produce an empty result,
+        # rather than look like a script failure.
+        if ($_.Exception.Message -match "No events were found") {
+            return [PSCustomObject]@{
+                Success = $true
+                Events  = @()
+                Error   = ""
+            }
+        }
+
+        Write-Warning "Cannot collect System event errors: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Events  = @()
+            Error   = $_.Exception.Message
+        }
+    }
+}
+
 ############## RAW DATA collection ################
 
 # SystemInfo
@@ -575,16 +864,30 @@ $DiskConfig = GetDiskInfo
 Write-Host "Getting network configuration..."
 $IPConfigData = GetIPConfig
 
+
+Write-Host "Getting WinHTTP proxy configuration..."
+$WinHttpProxyConfig = GetWinHttpProxy
+
+Write-Host "Getting routing table..."
+$RoutingTableConfig = GetRoutingTable
+
+Write-Host "Getting listening TCP ports..."
+$ListeningPortsConfig = GetListeningPorts
+
 Write-Host "Getting services information..."
 $ServicesConfig = GetServicesInfo
 
 Write-Host "Getting installed applications..."
 $AppsConfig = GetInstalledApplications
 
+
+
+Write-Host "Getting System event log errors..."
+$SystemEventErrorsConfig = GetSystemEventErrors -MaxEvents 20
+
+
 # Calculate script execution time before building the footer
 $interval = New-TimeSpan -Start $startTime -End (Get-Date)
-
-
 
 ############## RAW DATA Input To  HTML format ###############
 
@@ -898,7 +1201,171 @@ $objHTML += @"
         </tbody>
     </table>
 "@
-########## services
+
+############# WinHTTP Proxy Table #################
+
+if ($WinHttpProxyConfig.Success) {
+    $WinHttpProxyHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$WinHttpProxyConfig.Output
+    )
+} else {
+    $ProxyErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$WinHttpProxyConfig.Error
+    )
+
+    $WinHttpProxyHTML = "Unable to collect WinHTTP proxy configuration: $ProxyErrorHTML"
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th class="label">WinHTTP Proxy Configuration</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Command:</strong> netsh winhttp show proxy</td>
+            </tr>
+            <tr>
+                <td>
+                    <pre class="raw-output">$WinHttpProxyHTML</pre>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+"@
+
+############# Routing Table #################
+
+if ($RoutingTableConfig.Success) {
+
+    $RoutingTableHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$RoutingTableConfig.Output
+    )
+
+} else {
+
+    $RoutingErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$RoutingTableConfig.Error
+    )
+
+    $RoutingTableHTML = "Unable to collect routing table: $RoutingErrorHTML"
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th class="label">Routing Table</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Command:</strong> route print</td>
+            </tr>
+            <tr>
+                <td>
+                    <pre class="raw-output">$RoutingTableHTML</pre>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+"@
+
+
+############# Listening TCP Ports Table #################
+
+$ListeningPortRows = ""
+
+if (-not $ListeningPortsConfig.Success) {
+
+    $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$ListeningPortsConfig.Error
+    )
+
+    $ListeningPortRows = @"
+            <tr>
+                <td colspan="7">Unable to collect listening TCP ports: $ErrorHTML</td>
+            </tr>
+"@
+
+} elseif ($ListeningPortsConfig.Connections.Count -eq 0) {
+
+    $ListeningPortRows = @"
+            <tr>
+                <td colspan="7">No listening TCP ports found.</td>
+            </tr>
+"@
+
+} else {
+
+    foreach ($Connection in $ListeningPortsConfig.Connections) {
+
+        $IPHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.IP
+        )
+
+        $PortHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.Port
+        )
+
+        $AddressFamilyHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.AddressFamily
+        )
+
+        $PIDHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.PID
+        )
+
+        $ProcessHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.Process
+        )
+
+        $UserHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.User
+        )
+
+        $PathHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.Path
+        )
+
+        $ListeningPortRows += @"
+            <tr>
+                <td>$IPHTML</td>
+                <td><strong>$PortHTML</strong></td>
+                <td>$AddressFamilyHTML</td>
+                <td>$PIDHTML</td>
+                <td>$ProcessHTML</td>
+                <td>$UserHTML</td>
+                <td>$PathHTML</td>
+            </tr>
+"@
+    }
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="7" class="label">Listening TCP Ports ($($ListeningPortsConfig.Connections.Count))</th>
+            </tr>
+            <tr>
+                <th>Local IP</th>
+                <th>Port</th>
+                <th>IP Version</th>
+                <th>PID</th>
+                <th>Process</th>
+                <th>Run As</th>
+                <th>Executable Path</th>
+            </tr>
+        </thead>
+        <tbody>
+$ListeningPortRows
+        </tbody>
+    </table>
+"@
+
 
 ############# Services Table #################
 
@@ -1001,9 +1468,6 @@ $ServiceRows
 ############# Installed Applications Table #################
 
 $AppRows = ""
-
-
-
 if (-not $AppsConfig.Success -and $ApplicationsConfig.Applications.Count -eq 0) {
     $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
         [string]$AppsConfig.Error
@@ -1067,7 +1531,6 @@ if (-not $AppsConfig.Success -and $ApplicationsConfig.Applications.Count -eq 0) 
 "@
     }
 }
-
 $objHTML += @"
     <table>
         <thead>
@@ -1087,7 +1550,94 @@ $AppRows
         </tbody>
     </table>
 "@
+#######
 
+############# System Event Log Errors Table #################
+
+$EventErrorRows = ""
+
+if (-not $SystemEventErrorsConfig.Success) {
+
+    $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$SystemEventErrorsConfig.Error
+    )
+
+    $EventErrorRows = @"
+            <tr>
+                <td colspan="6">Unable to collect System event log errors: $ErrorHTML</td>
+            </tr>
+"@
+
+} elseif ($SystemEventErrorsConfig.Events.Count -eq 0) {
+
+    $EventErrorRows = @"
+            <tr>
+                <td colspan="6">No System errors found in the selected time period.</td>
+            </tr>
+"@
+
+} else {
+
+    foreach ($Event in $SystemEventErrorsConfig.Events) {
+
+        $TimeHTML = [System.Net.WebUtility]::HtmlEncode(
+            $Event.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
+        )
+
+        $IdHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Event.Id
+        )
+
+        $ProviderHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Event.ProviderName
+        )
+
+        $RecordIdHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Event.RecordId
+        )
+
+        $ProcessIdHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Event.ProcessId
+        )
+
+        $MessageHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Event.Message
+        )
+
+        $EventErrorRows += @"
+            <tr>
+                <td>$TimeHTML</td>
+                <td><strong>$IdHTML</strong></td>
+                <td>$ProviderHTML</td>
+                <td>$RecordIdHTML</td>
+                <td>$ProcessIdHTML</td>
+                <td>$MessageHTML</td>
+            </tr>
+"@
+    }
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="6" class="label">System Event Log - Last Errors ($($SystemEventErrorsConfig.Events.Count))</th>
+            </tr>
+            <tr>
+                <th>Time</th>
+                <th>Event ID</th>
+                <th>Source</th>
+                <th>Record ID</th>
+                <th>Process ID</th>
+                <th>Message</th>
+            </tr>
+        </thead>
+
+        <tbody>
+$EventErrorRows
+        </tbody>
+    </table>
+"@
 
 
 ###########################################################################
