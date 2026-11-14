@@ -117,7 +117,7 @@
     Krzysztof Gerus
 
 .VERSION
-    2.3
+    2.4
 
 #>
 
@@ -1695,3 +1695,38 @@ $filename = "$env:COMPUTERNAME {0:yyyyMMdd-HHmm}" -f (Get-Date)
 $objHTML | Out-File -FilePath ".\$filename.html" -Encoding UTF8
 
 # $objHTML | Out-File -FilePath "\\1.1.1.1\share\folder\$filename.html" -Encoding UTF8
+
+
+###########################################################################
+# Optional RSoP / Group Policy Report
+###########################################################################
+
+$RunRSOP = Read-Host "Generate RSoP / Group Policy report? (Y/N)"
+
+if ($RunRSOP -match '^[Yy]$') {
+
+    try {
+        $RSOPFileName = "{0}_RSOP_{1:yyyyMMdd-HHmmss}.html" -f `
+            $env:COMPUTERNAME, (Get-Date)
+
+        $RSOPPath = Join-Path -Path (Get-Location) -ChildPath $RSOPFileName
+
+        Write-Host "Generating RSoP / Group Policy report..."
+
+        & "$env:SystemRoot\System32\gpresult.exe" /H $RSOPPath /F
+
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $RSOPPath)) {
+            Write-Host "RSoP report saved to: $RSOPPath"
+        }
+        else {
+            Write-Warning "RSoP report generation failed. Exit code: $LASTEXITCODE"
+        }
+    }
+    catch {
+        Write-Warning "Cannot generate RSoP report: $($_.Exception.Message)"
+    }
+
+}
+else {
+    Write-Host "RSoP report skipped."
+}
