@@ -79,11 +79,46 @@
     The script performs inventory and diagnostic data collection only.
     The collected information is written to a local HTML report.
 
-.AUTHOR
+.HELP
+    Quick execution from GitHub:
+
+    The following PowerShell one-liner downloads the latest inventory.ps1
+    script from GitHub to the local TEMP directory, executes it using
+    Windows PowerShell and removes the downloaded script after execution.
+
+    The generated HTML inventory report remains in the current working
+    directory.
+
+    Command:
+
+    $u='https://raw.githubusercontent.com/Gallangher/OS_Infos/refs/heads/main/inventory.ps1'; $s=Join-Path $env:TEMP 'inventory.ps1'; Invoke-WebRequest $u -OutFile $s -UseBasicParsing -ErrorAction Stop; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $s; Remove-Item $s -Force -ErrorAction SilentlyContinue
+
+    Example:
+
+    PS C:\Temp> <run the command above>
+
+    The HTML report will be generated in:
+
+    C:\Temp
+
+    Requirements:
+    - Internet access to raw.githubusercontent.com
+    - PowerShell
+    - Permission to execute the inventory commands used by the script
+
+    Security note:
+    The command downloads and immediately executes the current version
+    of inventory.ps1 from the main GitHub branch. For controlled production
+    environments, consider using a URL pinned to a specific Git commit
+    or validating the downloaded script hash before execution.
+
+
+    .AUTHOR
     Krzysztof Gerus
 
 .VERSION
-    2.2
+    2.3
+
 #>
 
 
