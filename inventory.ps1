@@ -46,10 +46,11 @@
       "route print", including active and persistent routes reported
       by Windows.
 
-    - Listening TCP ports:
-      TCP endpoints currently in the LISTEN state, including local IP
-      address, port, IPv4/IPv6 address family, owning process ID,
-      process name, process account and executable path when available.
+    - Listening TCP ports and UDP endpoints:
+      Local TCP ports in the LISTEN state and local UDP endpoints, including
+      local IP address, port, IPv4/IPv6 address family, owning process ID,
+      process name, related Windows service, service account, process user
+      and executable path when available.
 
     - Local administrators:
       Direct members of the local Administrators group, including account
@@ -68,6 +69,8 @@
       date and installation directory when this information is available.
 
       On 64-bit systems, both 64-bit and 32-bit registry views are checked.
+
+      Prevous Vendoer tooling is highlighted in the HTML report for review.
 
     - System event log:
       Recent Critical and Error events from the Windows System event log.
@@ -117,7 +120,12 @@
     Krzysztof Gerus
 
 .VERSION
-    2.4
+    2.5 
+        16.11.2026, UDP connectios added Prevous vendor toolin is highlighted
+                
+
+    Change Log
+
 
 #>
 
@@ -463,121 +471,274 @@ function GetRoutingTable {
     }
 }
 
+
 function GetListeningPorts {
+
     try {
-        $Connections = @(
-            Get-NetTCPConnection -State Listen -ErrorAction Stop
-        )
-    }
-    catch {
-        Write-Warning "Cannot collect listening TCP ports: $($_.Exception.Message)"
 
-        return [PSCustomObject]@{
-            Success     = $false
-            Connections = @()
-            Error       = $_.Exception.Message
-        }
-    }
+        # ------------------------------------------------------------
+        # Get Windows services once and group them by Process ID.
+        # This avoids querying Win32_Service separately for every port.
+        # ------------------------------------------------------------
+        $ServicesByPID = @{}
 
-    # Cache process information so the same PID is not queried repeatedly.
-    $ProcessCache = @{}
-
-    $Results = foreach ($Connection in $Connections) {
-
-        $PIDNumber = $Connection.OwningProcess
-
-        $ProcessName = "Unknown"
-        $ProcessPath = "Unknown"
-        $ProcessUser = "Unknown"
-
-        if (-not $ProcessCache.ContainsKey($PIDNumber)) {
-
-            try {
-                $Process = Get-Process -Id $PIDNumber -ErrorAction Stop
-
-                if ($Process.ProcessName) {
-                    $ProcessName = $Process.ProcessName
-                }
-
-                try {
-                    if ($Process.Path) {
-                        $ProcessPath = $Process.Path
-                    }
-                }
-                catch {
-                    $ProcessPath = "Access denied / unavailable"
-                }
-            }
-            catch {
-                $ProcessName = "Unknown"
+        Get-CimInstance Win32_Service -ErrorAction Stop |
+            Where-Object { $_.ProcessId -gt 0 } |
+            Group-Object ProcessId |
+            ForEach-Object {
+                $ServicesByPID[[int]$_.Name] = @($_.Group)
             }
 
-            # Get process owner.
+
+        # ------------------------------------------------------------
+        # Cache process information by PID.
+        # One process may own multiple TCP/UDP endpoints.
+        # ------------------------------------------------------------
+        $ProcessCache = @{}
+
+
+        # ------------------------------------------------------------
+        # Internal helper - resolve process information
+        # ------------------------------------------------------------
+        function Get-ProcessDetails {
+
+            param (
+                [Parameter(Mandatory = $true)]
+                [int]$ProcessId
+            )
+
+            if ($ProcessCache.ContainsKey($ProcessId)) {
+                return $ProcessCache[$ProcessId]
+            }
+
+            $ProcessName = "-"
+            $ProcessPath = "-"
+            $ProcessUser = "-"
+
             try {
-                $CimProcess = Get-CimInstance Win32_Process `
-                    -Filter "ProcessId=$PIDNumber" `
+
+                $Process = Get-CimInstance Win32_Process `
+                    -Filter "ProcessId = $ProcessId" `
                     -ErrorAction Stop
 
-                if ($CimProcess) {
-                    $Owner = Invoke-CimMethod `
-                        -InputObject $CimProcess `
-                        -MethodName GetOwner `
-                        -ErrorAction Stop
+                if ($Process) {
 
-                    if ($Owner.ReturnValue -eq 0 -and $Owner.User) {
+                    if (-not [string]::IsNullOrWhiteSpace($Process.Name)) {
+                        $ProcessName = $Process.Name
+                    }
 
-                        if ($Owner.Domain) {
-                            $ProcessUser = "$($Owner.Domain)\$($Owner.User)"
+                    if (-not [string]::IsNullOrWhiteSpace($Process.ExecutablePath)) {
+                        $ProcessPath = $Process.ExecutablePath
+                    }
+
+                    try {
+
+                        $Owner = Invoke-CimMethod `
+                            -InputObject $Process `
+                            -MethodName GetOwner `
+                            -ErrorAction Stop
+
+                        if ($Owner.ReturnValue -eq 0 -and
+                            -not [string]::IsNullOrWhiteSpace($Owner.User)) {
+
+                            if (-not [string]::IsNullOrWhiteSpace($Owner.Domain)) {
+                                $ProcessUser = "$($Owner.Domain)\$($Owner.User)"
+                            }
+                            else {
+                                $ProcessUser = $Owner.User
+                            }
                         }
-                        else {
-                            $ProcessUser = $Owner.User
-                        }
+                    }
+                    catch {
+                        $ProcessUser = "-"
                     }
                 }
             }
             catch {
-                $ProcessUser = "Unknown"
+                # Process may disappear between endpoint collection
+                # and process lookup.
             }
 
-            $ProcessCache[$PIDNumber] = [PSCustomObject]@{
-                Process = $ProcessName
-                User    = $ProcessUser
-                Path    = $ProcessPath
+            $Result = [PSCustomObject]@{
+                Name = $ProcessName
+                User = $ProcessUser
+                Path = $ProcessPath
+            }
+
+            $ProcessCache[$ProcessId] = $Result
+
+            return $Result
+        }
+
+
+        # ------------------------------------------------------------
+        # Build result collection
+        # ------------------------------------------------------------
+        $Connections = @()
+
+
+        # ============================================================
+        # TCP LISTENING PORTS
+        # ============================================================
+
+        $TCPConnections = Get-NetTCPConnection `
+            -State Listen `
+            -ErrorAction Stop
+
+        foreach ($TCP in $TCPConnections) {
+
+            $PIDNumber = [int]$TCP.OwningProcess
+
+            $ProcessInfo = Get-ProcessDetails -ProcessId $PIDNumber
+
+            $ServiceName = "-"
+            $ServiceAccount = "-"
+
+            if ($ServicesByPID.ContainsKey($PIDNumber)) {
+
+                $Services = @($ServicesByPID[$PIDNumber])
+
+                $ServiceName = (
+                    $Services.Name |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                ) -join ", "
+
+                $ServiceAccount = (
+                    $Services.StartName |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Select-Object -Unique
+                ) -join ", "
+
+                if ([string]::IsNullOrWhiteSpace($ServiceName)) {
+                    $ServiceName = "-"
+                }
+
+                if ([string]::IsNullOrWhiteSpace($ServiceAccount)) {
+                    $ServiceAccount = "-"
+                }
+            }
+
+
+            # Determine address family
+            if ($TCP.LocalAddress -match ":") {
+                $AddressFamily = "IPv6"
+            }
+            else {
+                $AddressFamily = "IPv4"
+            }
+
+
+            $Connections += [PSCustomObject]@{
+
+                Protocol       = "TCP"
+                IP             = $TCP.LocalAddress
+                Port           = $TCP.LocalPort
+                AddressFamily  = $AddressFamily
+                PID            = $PIDNumber
+                Process        = $ProcessInfo.Name
+                Service        = $ServiceName
+                ServiceAccount = $ServiceAccount
+                User           = $ProcessInfo.User
+                Path           = $ProcessInfo.Path
             }
         }
 
-        $ProcessInfo = $ProcessCache[$PIDNumber]
 
-        # Determine IPv4 / IPv6.
-        $AddressFamily = if (
-            $Connection.LocalAddress -match ":"
-        ) {
-            "IPv6"
-        }
-        else {
-            "IPv4"
+        # ============================================================
+        # UDP ENDPOINTS
+        # ============================================================
+
+        $UDPEndpoints = Get-NetUDPEndpoint -ErrorAction Stop
+
+        foreach ($UDP in $UDPEndpoints) {
+
+            $PIDNumber = [int]$UDP.OwningProcess
+
+            $ProcessInfo = Get-ProcessDetails -ProcessId $PIDNumber
+
+            $ServiceName = "-"
+            $ServiceAccount = "-"
+
+            if ($ServicesByPID.ContainsKey($PIDNumber)) {
+
+                $Services = @($ServicesByPID[$PIDNumber])
+
+                $ServiceName = (
+                    $Services.Name |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                ) -join ", "
+
+                $ServiceAccount = (
+                    $Services.StartName |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Select-Object -Unique
+                ) -join ", "
+
+                if ([string]::IsNullOrWhiteSpace($ServiceName)) {
+                    $ServiceName = "-"
+                }
+
+                if ([string]::IsNullOrWhiteSpace($ServiceAccount)) {
+                    $ServiceAccount = "-"
+                }
+            }
+
+
+            # Determine address family
+            if ($UDP.LocalAddress -match ":") {
+                $AddressFamily = "IPv6"
+            }
+            else {
+                $AddressFamily = "IPv4"
+            }
+
+
+            $Connections += [PSCustomObject]@{
+
+                Protocol       = "UDP"
+                IP             = $UDP.LocalAddress
+                Port           = $UDP.LocalPort
+                AddressFamily  = $AddressFamily
+                PID            = $PIDNumber
+                Process        = $ProcessInfo.Name
+                Service        = $ServiceName
+                ServiceAccount = $ServiceAccount
+                User           = $ProcessInfo.User
+                Path           = $ProcessInfo.Path
+            }
         }
 
-        [PSCustomObject]@{
-            IP            = $Connection.LocalAddress
-            Port          = $Connection.LocalPort
-            AddressFamily = $AddressFamily
-            PID           = $PIDNumber
-            Process       = $ProcessInfo.Process
-            User          = $ProcessInfo.User
-            Path          = $ProcessInfo.Path
+
+        # ------------------------------------------------------------
+        # Sort results:
+        # Protocol -> Port -> IP -> Process
+        # ------------------------------------------------------------
+        $Connections = @(
+            $Connections |
+                Sort-Object Protocol, Port, IP, Process
+        )
+
+
+        # ------------------------------------------------------------
+        # Return configuration object
+        # ------------------------------------------------------------
+        return [PSCustomObject]@{
+
+            Success     = $true
+            Error       = $null
+            Connections = $Connections
         }
     }
+    catch {
 
-    return [PSCustomObject]@{
-        Success     = $true
-        Connections = @(
-            $Results | Sort-Object Port, IP
-        )
-        Error       = ""
+        return [PSCustomObject]@{
+
+            Success     = $false
+            Error       = $_.Exception.Message
+            Connections = @()
+        }
     }
 }
-
 
 #services
 function GetServicesInfo {
@@ -906,8 +1067,16 @@ $WinHttpProxyConfig = GetWinHttpProxy
 Write-Host "Getting routing table..."
 $RoutingTableConfig = GetRoutingTable
 
-Write-Host "Getting listening TCP ports..."
+
+Write-Host "Getting listening TCP ports and UDP endpoints..."
 $ListeningPortsConfig = GetListeningPorts
+if ($ListeningPortsConfig.Success) {
+    Write-Host "Found $($ListeningPortsConfig.Connections.Count) TCP/UDP listening endpoints."
+}
+else {
+    Write-Warning "Unable to collect listening ports: $($ListeningPortsConfig.Error)"
+}
+
 
 Write-Host "Getting services information..."
 $ServicesConfig = GetServicesInfo
@@ -1002,7 +1171,14 @@ $objHTML = @"
             background-color: #f3f4f6;
             color: #111827;
                        }
-
+        .table-description {
+            padding: 8px 6px;
+            font-size: 12px;
+            font-weight: normal;
+            color: #444444;
+            background-color: #f8f8f8;
+            line-height: 1.4;
+            }
 
 
     </style>
@@ -1309,7 +1485,9 @@ $objHTML += @"
 "@
 
 
-############# Listening TCP Ports Table #################
+# ============================================================
+# Listening TCP Ports and UDP Endpoints - HTML section
+# ============================================================
 
 $ListeningPortRows = ""
 
@@ -1320,61 +1498,104 @@ if (-not $ListeningPortsConfig.Success) {
     )
 
     $ListeningPortRows = @"
-            <tr>
-                <td colspan="7">Unable to collect listening TCP ports: $ErrorHTML</td>
-            </tr>
+        <tr>
+            <td colspan="10">
+                Unable to collect listening TCP ports and UDP endpoints:
+                $ErrorHTML
+            </td>
+        </tr>
 "@
-
-} elseif ($ListeningPortsConfig.Connections.Count -eq 0) {
+}
+elseif (-not $ListeningPortsConfig.Connections -or
+        $ListeningPortsConfig.Connections.Count -eq 0) {
 
     $ListeningPortRows = @"
-            <tr>
-                <td colspan="7">No listening TCP ports found.</td>
-            </tr>
+        <tr>
+            <td colspan="10">
+                No listening TCP ports or UDP endpoints were found.
+            </td>
+        </tr>
 "@
-
-} else {
+}
+else {
 
     foreach ($Connection in $ListeningPortsConfig.Connections) {
 
-        $IPHTML = [System.Net.WebUtility]::HtmlEncode(
+        $Protocol = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.Protocol
+        )
+
+        $IP = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.IP
         )
 
-        $PortHTML = [System.Net.WebUtility]::HtmlEncode(
+        $Port = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.Port
         )
 
-        $AddressFamilyHTML = [System.Net.WebUtility]::HtmlEncode(
+        $AddressFamily = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.AddressFamily
         )
 
-        $PIDHTML = [System.Net.WebUtility]::HtmlEncode(
+        $PIDNumber = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.PID
         )
 
-        $ProcessHTML = [System.Net.WebUtility]::HtmlEncode(
+        $Process = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.Process
         )
 
-        $UserHTML = [System.Net.WebUtility]::HtmlEncode(
+        $Service = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.Service
+        )
+
+        $ServiceAccount = [System.Net.WebUtility]::HtmlEncode(
+            [string]$Connection.ServiceAccount
+        )
+
+        $ProcessUser = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.User
         )
 
-        $PathHTML = [System.Net.WebUtility]::HtmlEncode(
+        $Path = [System.Net.WebUtility]::HtmlEncode(
             [string]$Connection.Path
         )
 
+
+        if ([string]::IsNullOrWhiteSpace($Process)) {
+            $Process = "-"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Service)) {
+            $Service = "-"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ServiceAccount)) {
+            $ServiceAccount = "-"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ProcessUser)) {
+            $ProcessUser = "-"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $Path = "-"
+        }
+
+
         $ListeningPortRows += @"
-            <tr>
-                <td>$IPHTML</td>
-                <td><strong>$PortHTML</strong></td>
-                <td>$AddressFamilyHTML</td>
-                <td>$PIDHTML</td>
-                <td>$ProcessHTML</td>
-                <td>$UserHTML</td>
-                <td>$PathHTML</td>
-            </tr>
+        <tr>
+            <td>$Protocol</td>
+            <td>$IP</td>
+            <td>$Port</td>
+            <td>$AddressFamily</td>
+            <td>$PIDNumber</td>
+            <td>$Process</td>
+            <td>$Service</td>
+            <td>$ServiceAccount</td>
+            <td>$ProcessUser</td>
+            <td>$Path</td>
+        </tr>
 "@
     }
 }
@@ -1382,22 +1603,45 @@ if (-not $ListeningPortsConfig.Success) {
 $objHTML += @"
     <table>
         <thead>
+
             <tr>
-                <th colspan="7" class="label">Listening TCP Ports ($($ListeningPortsConfig.Connections.Count))</th>
+                <th colspan="10" class="label">
+                    Listening TCP Ports and UDP Endpoints ($($ListeningPortsConfig.Connections.Count))
+                </th>
             </tr>
+
             <tr>
-                <th>Local IP</th>
+                <td colspan="10" class="table-description">
+                    Shows local TCP ports in the LISTEN state and local UDP endpoints,
+                    including the owning process, related Windows service, service account,
+                    process user and executable path when available.
+                    <br><br>
+                    <strong>Note:</strong> For the most complete results, run the script as Administrator.
+                    When the script is run without elevated privileges, collection will continue without
+                    generating an error, but some protected process information, such as the process user
+                    or executable path, may not be available. This is expected by design.
+                </td>
+            </tr>
+
+            <tr>
+                <th>Protocol</th>
+                <th>IP</th>
                 <th>Port</th>
-                <th>IP Version</th>
+                <th>Address Family</th>
                 <th>PID</th>
                 <th>Process</th>
-                <th>Run As</th>
-                <th>Executable Path</th>
+                <th>Service</th>
+                <th>Service Account</th>
+                <th>Process User</th>
+                <th>Path</th>
             </tr>
+
         </thead>
+
         <tbody>
 $ListeningPortRows
         </tbody>
+
     </table>
 "@
 
@@ -1484,6 +1728,21 @@ $objHTML += @"
             <tr>
                 <th colspan="7" class="label">Services</th>
             </tr>
+
+
+  <tr>
+    <td colspan="7" class="table-description">
+        Shows installed Windows services, including the service name, display name,
+        current state, startup mode, delayed start configuration, logon account
+        and service dependencies.
+        <br><br>
+        <strong>Note:</strong> Services configured with <strong>Automatic</strong>
+        startup that are not currently <strong>Running</strong> are highlighted in
+        <strong>red</strong>. This may indicate a service that failed to start or
+        stopped after startup and should be reviewed.
+    </td>
+</tr>
+
             <tr>
                 <th>Name</th>
                 <th>Display Name</th>
@@ -1503,25 +1762,49 @@ $ServiceRows
 ############# Installed Applications Table #################
 
 $AppRows = ""
-if (-not $AppsConfig.Success -and $ApplicationsConfig.Applications.Count -eq 0) {
+
+if (-not $AppsConfig.Success -and $AppsConfig.Applications.Count -eq 0) {
+
     $ErrorHTML = [System.Net.WebUtility]::HtmlEncode(
         [string]$AppsConfig.Error
     )
 
     $AppRows = @"
             <tr>
-                <td colspan="5" class="alert-red">Unable to collect installed applications: $ErrorHTML</td>
+                <td colspan="5" class="alert-red">
+                    Unable to collect installed applications: $ErrorHTML
+                </td>
             </tr>
 "@
-} elseif ($AppsConfig.Applications.Count -eq 0) {
+}
+elseif ($AppsConfig.Applications.Count -eq 0) {
+
     $AppRows = @"
             <tr>
-                <td colspan="5">No installed applications found.</td>
+                <td colspan="5">
+                    No installed applications found.
+                </td>
             </tr>
 "@
-} else {
+}
+else {
+
     foreach ($App in $AppsConfig.Applications) {
-        # Encode every value before inserting it into HTML
+
+        # Highlight the Publisher field when it contains "Atos".
+        # The match is case-insensitive and therefore also detects values
+        # such as "ATOS SE", "Atos Poland" or "Atos Information Technology".
+        $PublisherClass = if (
+            [string]$App.Publisher -match "Atos"
+        ) {
+            ' class="alert-red"'
+        }
+        else {
+            ''
+        }
+
+
+        # Encode every value before inserting it into HTML.
         $AppNameHTML = [System.Net.WebUtility]::HtmlEncode(
             [string]$App.Name
         )
@@ -1542,36 +1825,58 @@ if (-not $AppsConfig.Success -and $ApplicationsConfig.Applications.Count -eq 0) 
             [string]$App.InstallLocation
         )
 
+
         $AppRows += @"
             <tr>
                 <td><strong>$AppNameHTML</strong></td>
                 <td>$AppVersionHTML</td>
-                <td>$AppPublisherHTML</td>
+                <td$PublisherClass>$AppPublisherHTML</td>
                 <td>$AppDateHTML</td>
                 <td>$AppLocationHTML</td>
             </tr>
 "@
     }
 
-    # Append a warning row if partial registry read errors occurred
+
+    # Append a warning row if partial registry read errors occurred.
     if (-not [string]::IsNullOrWhiteSpace($AppsConfig.Error)) {
+
         $PartialErrorHTML = [System.Net.WebUtility]::HtmlEncode(
             [string]$AppsConfig.Error
         )
 
         $AppRows += @"
             <tr>
-                <td colspan="5" class="alert-red">Warning (partial read errors): $PartialErrorHTML</td>
+                <td colspan="5" class="alert-red">
+                    Warning (partial read errors): $PartialErrorHTML
+                </td>
             </tr>
 "@
     }
 }
+
+
 $objHTML += @"
     <table>
         <thead>
+
             <tr>
-                <th colspan="5" class="label">Installed Applications ($($AppsConfig.Applications.Count))</th>
+                <th colspan="5" class="label">
+                    Installed Applications ($($AppsConfig.Applications.Count))
+                </th>
             </tr>
+
+            <tr>
+                <td colspan="5" class="table-description">
+                    Shows applications registered as installed on this server, including
+                    version, publisher, reported installation date and installation location.
+                    <br><br>
+                    <strong>Note:</strong> Applications published by the previous service provider
+                    may still be installed on this server. Identified entries are highlighted in
+                    <strong>red</strong> for identification and review.
+                </td>
+            </tr>
+
             <tr>
                 <th>Application Name</th>
                 <th>Version</th>
@@ -1579,13 +1884,16 @@ $objHTML += @"
                 <th>Install Date</th>
                 <th>Install Location</th>
             </tr>
+
         </thead>
+
         <tbody>
 $AppRows
         </tbody>
+
     </table>
 "@
-#######
+
 
 ############# System Event Log Errors Table #################
 
