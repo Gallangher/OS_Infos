@@ -2,6 +2,16 @@
 .SYNOPSIS
     Windows Server Inventory Report
 
+
+.VERSION
+    2.5 
+        16.11.2026, UDP connectios added Prevous vendor toolin is highlighted
+    2.6
+        18.11.2026, XEN/Citrix deces listed
+                
+
+    
+
 .DESCRIPTION
     Collects configuration, hardware, network, software and operational
     information from a Windows system and generates an HTML inventory report.
@@ -118,14 +128,6 @@
 
     .AUTHOR
     Krzysztof Gerus
-
-.VERSION
-    2.5 
-        16.11.2026, UDP connectios added Prevous vendor toolin is highlighted
-                
-
-    Change Log
-
 
 #>
 
@@ -1042,6 +1044,55 @@ function GetSystemEventErrors {
     }
 }
 
+function GetXenDevices {
+    try {
+        if (-not (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue)) {
+            throw "Get-PnpDevice cmdlet is not available on this system."
+        }
+
+        # Enable visibility of non-present devices.
+        $env:devmgr_show_nonpresent_devices = 1
+
+        $Devices = @(
+            Get-PnpDevice -ErrorAction Stop |
+                Where-Object {
+                    $_.FriendlyName -match "Xen|Citrix" -or
+                    $_.InstanceId -match "XEN"
+                } |
+                Sort-Object Class, FriendlyName
+        )
+
+        if ($Devices.Count -eq 0) {
+            return [PSCustomObject]@{
+                Success = $true
+                Output  = "No Xen / Citrix devices found."
+                Error   = ""
+            }
+        }
+
+        # Convert selected properties to plain text for HTML <pre>.
+        $Output = $Devices |
+            Select-Object Status, Class, FriendlyName, InstanceId |
+            Format-Table -AutoSize |
+            Out-String -Width 4096
+
+        return [PSCustomObject]@{
+            Success = $true
+            Output  = $Output.TrimEnd()
+            Error   = ""
+        }
+    }
+    catch {
+        Write-Warning "Cannot collect Xen devices: $($_.Exception.Message)"
+
+        return [PSCustomObject]@{
+            Success = $false
+            Output  = ""
+            Error   = $_.Exception.Message
+        }
+    }
+}
+
 ############## RAW DATA collection ################
 
 # SystemInfo
@@ -1088,6 +1139,11 @@ $AppsConfig = GetInstalledApplications
 
 Write-Host "Getting System event log errors..."
 $SystemEventErrorsConfig = GetSystemEventErrors -MaxEvents 20
+
+
+Write-Host "Getting Xen / Citrix devices..."
+$XenDevicesConfig = GetXenDevices
+
 
 
 # Calculate script execution time before building the footer
@@ -1981,6 +2037,46 @@ $EventErrorRows
         </tbody>
     </table>
 "@
+
+
+
+############# Xen Devices Table #################
+
+if ($XenDevicesConfig.Success) {
+
+    $XenDevicesHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$XenDevicesConfig.Output
+    )
+
+} else {
+
+    $XenErrorHTML = [System.Net.WebUtility]::HtmlEncode(
+        [string]$XenDevicesConfig.Error
+    )
+
+    $XenDevicesHTML = "Unable to collect Xen devices: $XenErrorHTML"
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th class="label">Xen / Citrix Devices</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Command:</strong> Get-PnpDevice | Where-Object { FriendlyName or InstanceId contains Xen / Citrix }</td>
+            </tr>
+            <tr>
+                <td>
+                    <pre class="raw-output">$XenDevicesHTML</pre>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+"@
+
 
 
 ###########################################################################
