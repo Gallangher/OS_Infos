@@ -8,6 +8,10 @@
         16.11.2026, UDP connectios added Prevous vendor toolin is highlighted
     2.6
         18.11.2026, XEN/Citrix deces listed
+    2.7          
+        24.11.2026, w32Time service checks
+
+        
                 
 
     
@@ -1093,6 +1097,139 @@ function GetXenDevices {
     }
 }
 
+function GetTimeServiceInfo {
+    [CmdletBinding()]
+    param()
+
+    $W32tmPath = "$env:SystemRoot\System32\w32tm.exe"
+    $OutputSections = @()
+    $Errors = @()
+
+    $Commands = @(
+        [PSCustomObject]@{
+            Title     = "Time Service Status"
+            Arguments = @("/query", "/status")
+            Command   = "w32tm /query /status"
+        }
+        [PSCustomObject]@{
+            Title     = "Current Time Source"
+            Arguments = @("/query", "/source")
+            Command   = "w32tm /query /source"
+        }
+        [PSCustomObject]@{
+            Title     = "Configured Time Peers"
+            Arguments = @("/query", "/peers")
+            Command   = "w32tm /query /peers"
+        }
+    )
+
+    foreach ($CommandInfo in $Commands) {
+        try {
+            $CommandOutput = @(
+                & $W32tmPath $CommandInfo.Arguments 2>&1
+            )
+
+            $ExitCode = $LASTEXITCODE
+
+            if ($ExitCode -ne 0) {
+                $ErrorMessage = "{0} failed with exit code {1}. Output: {2}" -f `
+                    $CommandInfo.Command,
+                    $ExitCode,
+                    ($CommandOutput -join " ")
+
+                $Errors += $ErrorMessage
+
+                $OutputSections += @"
+===============================================================================
+$($CommandInfo.Title)
+Command: $($CommandInfo.Command)
+===============================================================================
+ERROR: $ErrorMessage
+"@
+            }
+            else {
+                $OutputSections += @"
+===============================================================================
+$($CommandInfo.Title)
+Command: $($CommandInfo.Command)
+===============================================================================
+$($CommandOutput -join [Environment]::NewLine)
+"@
+            }
+        }
+        catch {
+            $ErrorMessage = "Cannot execute $($CommandInfo.Command): $($_.Exception.Message)"
+            $Errors += $ErrorMessage
+
+            $OutputSections += @"
+===============================================================================
+$($CommandInfo.Title)
+Command: $($CommandInfo.Command)
+===============================================================================
+ERROR: $ErrorMessage
+"@
+        }
+    }
+
+    # Get Time-Service Warning Event ID 47 from the System event log.
+    $TimeWarnings = @()
+
+    try {
+        $TimeWarnings = @(
+            Get-WinEvent `
+                -FilterHashtable @{
+                    LogName      = "System"
+                    ProviderName = "Microsoft-Windows-Time-Service"
+                    Id           = 47
+                    Level        = 3
+                } `
+                -ErrorAction Stop |
+                ForEach-Object {
+
+                    $EventMessage = if (
+                        [string]::IsNullOrWhiteSpace([string]$_.Message)
+                    ) {
+                        "Message unavailable"
+                    }
+                    else {
+                        ([string]$_.Message).Trim() -replace "\r?\n", " "
+                    }
+
+                    [PSCustomObject]@{
+                        TimeCreated  = $_.TimeCreated
+                        Id           = $_.Id
+                        Level        = $_.LevelDisplayName
+                        ProviderName = $_.ProviderName
+                        RecordId     = $_.RecordId
+                        Message      = $EventMessage
+                    }
+                } |
+                Sort-Object TimeCreated -Descending
+        )
+    }
+    catch {
+    # Get-WinEvent can throw when no matching events exist.
+    # For this inventory check, no Event ID 47 is a valid result.
+    $TimeWarnings = @()
+}
+
+    return [PSCustomObject]@{
+        Success  = ($Errors.Count -eq 0)
+
+        Output   = (
+            $OutputSections -join ([Environment]::NewLine * 2)
+        ).TrimEnd()
+
+        Warnings = $TimeWarnings
+
+        Error    = ($Errors -join "; ")
+    }
+}
+
+
+
+
+
 ############## RAW DATA collection ################
 
 # SystemInfo
@@ -1144,6 +1281,9 @@ $SystemEventErrorsConfig = GetSystemEventErrors -MaxEvents 20
 Write-Host "Getting Xen / Citrix devices..."
 $XenDevicesConfig = GetXenDevices
 
+
+Write-Host "Getting Windows Time Service information..."
+$TimeServiceConfig = GetTimeServiceInfo
 
 
 # Calculate script execution time before building the footer
@@ -2077,6 +2217,117 @@ $objHTML += @"
     </table>
 "@
 
+
+
+############# Windows Time Service Configuration #################
+
+############# Windows Time Service Configuration #################
+
+$TimeServiceOutputHTML = [System.Net.WebUtility]::HtmlEncode(
+    [string]$TimeServiceConfig.Output
+)
+
+if ([string]::IsNullOrWhiteSpace($TimeServiceOutputHTML)) {
+    $TimeServiceOutputHTML = "No Windows Time Service output was returned."
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th class="label">Windows Time Service Configuration</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>
+                    <strong>Commands:</strong><br>
+                    w32tm /query /status<br>
+                    w32tm /query /source<br>
+                    w32tm /query /peers
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <pre class="raw-output">$TimeServiceOutputHTML</pre>
+                </td>
+            </tr>
+        </tbody>
+    </table>
+"@
+
+############# Time-Service Event ID 47 Table #################
+
+$TimeWarningRows = ""
+
+if ($TimeServiceConfig.Warnings.Count -eq 0) {
+
+    $TimeWarningRows = @"
+            <tr>
+                <td colspan="5">No Time-Service Event ID 47 warnings found in the System event log.</td>
+            </tr>
+"@
+
+} else {
+
+    foreach ($TimeWarning in $TimeServiceConfig.Warnings) {
+
+        $TimeHTML = if ($null -ne $TimeWarning.TimeCreated) {
+            [System.Net.WebUtility]::HtmlEncode(
+                $TimeWarning.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
+            )
+        }
+        else {
+            "Unknown"
+        }
+
+        $IdHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$TimeWarning.Id
+        )
+
+        $LevelHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$TimeWarning.Level
+        )
+
+        $RecordIdHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$TimeWarning.RecordId
+        )
+
+        $MessageHTML = [System.Net.WebUtility]::HtmlEncode(
+            [string]$TimeWarning.Message
+        )
+
+        $TimeWarningRows += @"
+            <tr>
+                <td>$TimeHTML</td>
+                <td><strong>$IdHTML</strong></td>
+                <td>$LevelHTML</td>
+                <td>$RecordIdHTML</td>
+                <td>$MessageHTML</td>
+            </tr>
+"@
+    }
+}
+
+$objHTML += @"
+    <table>
+        <thead>
+            <tr>
+                <th colspan="5" class="label">Time-Service Warnings - Event ID 47 ($($TimeServiceConfig.Warnings.Count))</th>
+            </tr>
+            <tr>
+                <th>Time</th>
+                <th>Event ID</th>
+                <th>Level</th>
+                <th>Record ID</th>
+                <th>Message</th>
+            </tr>
+        </thead>
+        <tbody>
+$TimeWarningRows
+        </tbody>
+    </table>
+"@
 
 
 ###########################################################################
